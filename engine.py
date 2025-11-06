@@ -235,6 +235,7 @@ class DeepSpeedEngine(Module):
         self.moe_layers = []
         self._step_applied = False
         self._global_grad_norm = None
+        self._clipped_global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
         self.checkpoint_engine = None
 
@@ -589,6 +590,10 @@ class DeepSpeedEngine(Module):
             float: norm
         """
         return self._global_grad_norm
+    
+    def get_clipped_global_grad_norm(self):
+        """获取裁剪后的全局梯度范数"""
+        return getattr(self, '_clipped_global_grad_norm', None)
 
     def __getattr__(self, name):
         """
@@ -2282,6 +2287,10 @@ class DeepSpeedEngine(Module):
 
         if hasattr(self.optimizer, '_global_grad_norm'):
             self._global_grad_norm = self.optimizer._global_grad_norm
+
+        # 获取裁剪后的梯度范数（如果可用）
+        if hasattr(self.optimizer, 'get_clipped_global_grad_norm'):
+            self._clipped_global_grad_norm = self.optimizer.get_clipped_global_grad_norm()
 
         # Quantize the updated parameter if there is no overflow
         if self.quantizer:

@@ -158,6 +158,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.elastic_checkpoint = elastic_checkpoint
         self.param_names = param_names
         self.mpu = mpu
+        self.cliped_norm_groups=[]
         # differences from apex.fp16_utils:
         # - assume all model params in fp16
         # - assume all params requires grad
@@ -210,6 +211,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.has_moe_layers:
             self._configure_moe_settings()
         self._global_grad_norm = 0.
+        self._clipped_global_grad_norm = 0.
 
         if mpu is None:
             self.model_parallel_group = None
@@ -1793,6 +1795,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.custom_loss_scaler = True
         self.external_loss_scale = loss_scale
 
+    def get_clipped_global_grad_norm(self):
+        """获取裁剪后的全局梯度范数"""
+        return self._clipped_global_grad_norm
+
     def scaled_global_norm(self, norm_type=2):
         assert norm_type == 2, "only L2 norm supported"
         norm_groups = []
@@ -1811,6 +1817,25 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         # calculating L2 norm
         return torch.linalg.vector_norm(torch.stack(norm_groups), ord=norm_type)
+    
+    def scaled_global_norm_for_logging(self, averaged_gradients_cliped,params_in_partition,norm_type=2):
+        assert norm_type == 2, "only L2 norm supported"
+        norm_groups = []
+        # for i, group in enumerate(self.bit16_groups):
+        if self.cpu_offload:
+            # complete complete_grad_norm_calculation_for_cpu_offload return python float, moving back to
+            # torch.tensor as else statement returns tensor as well
+            norm = torch.tensor(self.complete_grad_norm_calculation_for_cpu_offload(self.params_in_partition[i]),
+                                device=self.device)
+            self.cliped_norm_groups.append(norm)
+        else:
+            self.cliped_norm_groups.append(self.get_grad_norm_direct(averaged_gradients_cliped, params_in_partition))
+
+        if self.has_moe_layers:
+            self._average_expert_grad_norms(norm_groups)
+
+        # calculating L2 norm
+        # return torch.linalg.vector_norm(torch.stack(norm_groups), ord=norm_type)
 
     def get_bit16_param_group(self, group_no):
         bit16_partitions = self.parallel_partitioned_bit16_groups[group_no]
@@ -1909,12 +1934,20 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         single_grad_partition.numel(), self.partition_size[i], i, partition_id)
 
                 self.single_partition_of_fp32_groups[i].grad = single_grad_partition
+
+                grad_groups_flat=self.unscale_and_clip_grads_for_logging([single_grad_partition], scaled_global_grad_norm)
+                for grad_logging in grad_groups_flat:
+                    averaged_gradients_cliped=_unflatten_dense_tensors(grad_logging, self.averaged_gradients[i])
+                
+                # 计算裁剪后的全局梯度范数
+                self.scaled_global_norm_for_logging(averaged_gradients_cliped,self.params_in_partition[i])
+
                 # release all the gradient since we have already created a necessary copy in dp_grad_partition(ZeRO stage2)
                 self.free_grad_in_param_list(self.params_in_partition[i])
 
                 self.averaged_gradients[i] = None
 
-                self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
+                # self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
 
                 self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()
 
@@ -1929,6 +1962,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 bit16_partitions[partition_id].data.copy_(fp32_partition.data)
                 self.timers(OPTIMIZER_STEP_TIMER).stop()
 
+        # 计算一次裁剪后的梯度范数
+        self._clipped_global_grad_norm=torch.linalg.vector_norm(torch.stack(self.cliped_norm_groups), ord=2) / self.loss_scale
+        self.cliped_norm_groups=[]
         see_memory_usage('After optimizer before all-gather')
         if self.cpu_offload:
             self.reset_cpu_buffers()
@@ -1991,6 +2027,25 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             else:
                 grad.data.mul_(1. / combined_scale)
 
+    def unscale_and_clip_grads_for_logging(self, grad_groups_flat, total_norm):
+        # compute combined scale factor for this group
+        combined_scale = self.loss_scale
+        if self.clip_grad > 0.:
+            # norm is in fact norm*scale
+            clip = ((total_norm / self.loss_scale) + 1e-6) / self.clip_grad
+            clip = torch.clamp(clip, min=1.0)
+            combined_scale = clip * self.loss_scale
+        print(f"loss_scale:{self.loss_scale};clip_grad:{self.clip_grad};combined_scale:{combined_scale}")
+
+        for grad in grad_groups_flat:
+            if isinstance(grad, list):
+                sub_partitions = grad
+                for g in sub_partitions:
+                    g.data.mul_(1. / combined_scale)
+            else:
+                grad.data.mul_(1. / combined_scale)
+        return grad_groups_flat
+    
     def _check_overflow(self, partition_gradients=True):
         self.overflow = self.has_overflow(partition_gradients)
 
