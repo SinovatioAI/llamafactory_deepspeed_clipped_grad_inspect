@@ -2598,6 +2598,13 @@ class Trainer:
                                 # In some cases the grad norm may not return a float
                                 if hasattr(grad_norm, "item"):
                                     grad_norm = grad_norm.item()
+
+                                # 同时获取裁剪后的梯度范数（如果可用）
+                                clipped_grad_norm = None
+                                if hasattr(model, 'get_clipped_global_grad_norm'):
+                                    clipped_grad_norm = model.get_clipped_global_grad_norm()
+                                    if clipped_grad_norm is not None and hasattr(clipped_grad_norm, "item"):
+                                        clipped_grad_norm = clipped_grad_norm.item()
                             else:
                                 grad_norm = _grad_norm
 
@@ -2622,6 +2629,7 @@ class Trainer:
                         self._maybe_log_save_evaluate(
                             tr_loss,
                             grad_norm,
+                            clipped_grad_norm,
                             model,
                             trial,
                             epoch,
@@ -2654,7 +2662,7 @@ class Trainer:
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
             self._maybe_log_save_evaluate(
-                tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=learning_rate
+                tr_loss, grad_norm, clipped_grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=learning_rate
             )
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
@@ -3062,7 +3070,7 @@ class Trainer:
         return metrics
 
     def _maybe_log_save_evaluate(
-        self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=None
+        self, tr_loss, grad_norm, clipped_grad_norm,model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=None
     ):
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
             if is_torch_xla_available():
@@ -3079,6 +3087,9 @@ class Trainer:
             logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
             if grad_norm is not None:
                 logs["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            # 记录裁剪后的梯度范数
+            if clipped_grad_norm is not None:
+                logs["clipped_grad_norm"] = clipped_grad_norm.item() if isinstance(clipped_grad_norm, torch.Tensor) else clipped_grad_norm
             if learning_rate is not None:
                 logs["learning_rate"] = learning_rate
             else:
