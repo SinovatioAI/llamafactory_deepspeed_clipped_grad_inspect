@@ -274,6 +274,8 @@ class LogCallback(TrainerCallback):
             current_steps=self.cur_steps,
             total_steps=self.max_steps,
             loss=state.log_history[-1].get("loss"),
+            grad_norm=state.log_history[-1].get("grad_norm"),
+            cliped_grad_norm=state.log_history[-1].get("clipped_grad_norm"),
             eval_loss=state.log_history[-1].get("eval_loss"),
             predict_loss=state.log_history[-1].get("predict_loss"),
             reward=state.log_history[-1].get("reward"),
